@@ -10,6 +10,8 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 add_executable(tcp_pose_generator_node src/tcp_pose_generator_node.cpp)
 
@@ -19,6 +21,8 @@ ament_target_dependencies(
   geometry_msgs
   tf2
   tf2_geometry_msgs
+  nav_msgs
+  visualization_msgs
 )
 
 install(
