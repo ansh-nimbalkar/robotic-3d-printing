@@ -1,0 +1,17 @@
+solid tilted_plane
+  facet normal 0 0 0
+    outer loop
+      vertex 0 0 0
+      vertex 100 0 50
+      vertex 100 100 50
+    endloop
+  endfacet
+
+  facet normal 0 0 0
+    outer loop
+      vertex 0 0 0
+      vertex 100 100 50
+      vertex 0 100 0
+    endloop
+  endfacet
+endsolid tilted_plane
