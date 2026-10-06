@@ -14,3 +14,14 @@ __pycache__/
 *.swp
 *.swo
 .DS_Store
+
+# Atom Slicer builds
+external/AtomSlicer/build/
+
+# AtomSlicer generated example outputs
+external/AtomSlicer/data/gcodes/
+external/AtomSlicer/data/toolpaths/
+
+# AtomSlicer generated output
+generated/atomslicer/*.gcode
+generated/atomslicer/*.ply
