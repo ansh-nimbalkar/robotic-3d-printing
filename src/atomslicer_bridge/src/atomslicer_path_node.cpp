@@ -1,7 +1,11 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Quaternion.h>
 
 #include <algorithm>
 #include <cmath>
@@ -34,11 +38,13 @@ public:
     declare_parameter<std::string>("gcode_file", "");
     declare_parameter<int>("path_stride", 1);
     declare_parameter<int>("normal_stride", 500);
+    declare_parameter<int>("pose_stride", 200);
     declare_parameter<double>("visualization_scale", 1.0);
 
     gcode_file_ = get_parameter("gcode_file").as_string();
     path_stride_ = get_parameter("path_stride").as_int();
     normal_stride_ = get_parameter("normal_stride").as_int();
+    pose_stride_ = get_parameter("pose_stride").as_int();
     visualization_scale_ =
       get_parameter("visualization_scale").as_double();
 
@@ -63,12 +69,17 @@ public:
       create_publisher<visualization_msgs::msg::Marker>(
         "/atomslicer/normals", qos);
 
+    poses_pub_ =
+      create_publisher<geometry_msgs::msg::PoseArray>(
+        "/atomslicer/poses", qos);
+
     // Give RViz/publishers a short time to initialise.
     timer_ = create_wall_timer(
       std::chrono::seconds(1),
       [this]() {
         publishPath();
         publishNormals();
+        publishPoses();
       });
   }
 
@@ -464,10 +475,208 @@ private:
     normals_pub_->publish(marker);
   }
 
+  void publishPoses()
+  {
+    geometry_msgs::msg::PoseArray pose_array;
+
+    pose_array.header.frame_id = "world";
+    pose_array.header.stamp = now();
+
+    const std::size_t stride =
+      std::max(1, pose_stride_);
+
+    std::size_t valid_pose_count = 0;
+
+    for (std::size_t i = 1;
+         i < waypoints_.size();
+         ++i)
+    {
+      const auto & previous = waypoints_[i - 1];
+      const auto & current = waypoints_[i];
+
+      // Positive extrusion means the move ending at the current
+      // waypoint is an actual deposition move.
+      if (current.extrusion <= 0.0) {
+        continue;
+      }
+
+      // -------------------------------------------------------
+      // TCP Z axis:
+      // AtomSlicer tool normal.
+      // -------------------------------------------------------
+
+      double zx = current.nx;
+      double zy = current.ny;
+      double zz = current.nz;
+
+      const double normal_magnitude =
+        std::sqrt(
+          zx * zx +
+          zy * zy +
+          zz * zz);
+
+      if (normal_magnitude < 1e-9) {
+        continue;
+      }
+
+      zx /= normal_magnitude;
+      zy /= normal_magnitude;
+      zz /= normal_magnitude;
+
+      // -------------------------------------------------------
+      // Local deposition tangent.
+      //
+      // The extrusion value at the current waypoint describes
+      // the move from previous -> current.
+      // -------------------------------------------------------
+
+      double dx = current.x - previous.x;
+      double dy = current.y - previous.y;
+      double dz = current.z - previous.z;
+
+      const double tangent_magnitude =
+        std::sqrt(
+          dx * dx +
+          dy * dy +
+          dz * dz);
+
+      if (tangent_magnitude < 1e-9) {
+        continue;
+      }
+
+      dx /= tangent_magnitude;
+      dy /= tangent_magnitude;
+      dz /= tangent_magnitude;
+
+      // -------------------------------------------------------
+      // TCP X axis:
+      // Project the path tangent onto the plane perpendicular
+      // to the tool normal.
+      // -------------------------------------------------------
+
+      const double tangent_dot_normal =
+        dx * zx +
+        dy * zy +
+        dz * zz;
+
+      double xx =
+        dx - tangent_dot_normal * zx;
+
+      double xy =
+        dy - tangent_dot_normal * zy;
+
+      double xz =
+        dz - tangent_dot_normal * zz;
+
+      const double x_magnitude =
+        std::sqrt(
+          xx * xx +
+          xy * xy +
+          xz * xz);
+
+      // Degenerate case where the trajectory tangent is
+      // effectively parallel to the normal.
+      if (x_magnitude < 1e-9) {
+        continue;
+      }
+
+      xx /= x_magnitude;
+      xy /= x_magnitude;
+      xz /= x_magnitude;
+
+      // -------------------------------------------------------
+      // TCP Y axis = Z x X.
+      // -------------------------------------------------------
+
+      double yx =
+        zy * xz - zz * xy;
+
+      double yy =
+        zz * xx - zx * xz;
+
+      double yz =
+        zx * xy - zy * xx;
+
+      const double y_magnitude =
+        std::sqrt(
+          yx * yx +
+          yy * yy +
+          yz * yz);
+
+      if (y_magnitude < 1e-9) {
+        continue;
+      }
+
+      yx /= y_magnitude;
+      yy /= y_magnitude;
+      yz /= y_magnitude;
+
+      // -------------------------------------------------------
+      // At this point:
+      //
+      // X = local deposition direction
+      // Y = Z x X
+      // Z = AtomSlicer tool normal
+      //
+      // These axes form the complete TCP orientation.
+      // -------------------------------------------------------
+
+      tf2::Matrix3x3 rotation(
+        xx, yx, zx,
+        xy, yy, zy,
+        xz, yz, zz);
+
+      tf2::Quaternion quaternion;
+      rotation.getRotation(quaternion);
+      quaternion.normalize();
+
+      // Downsample only the RViz PoseArray.
+      // Orientation is still calculated for every valid
+      // deposition waypoint encountered above.
+      if ((valid_pose_count % stride) != 0) {
+        ++valid_pose_count;
+        continue;
+      }
+
+      geometry_msgs::msg::Pose pose;
+
+      // PoseArray is currently used for visualization, so its
+      // position uses the same visualization scale as the path
+      // and normal markers. The original waypoints_ remain in
+      // true ROS units (metres).
+      pose.position.x =
+        scaleForVisualization(
+          current.x,
+          visualization_center_x_);
+
+      pose.position.y =
+        scaleForVisualization(
+          current.y,
+          visualization_center_y_);
+
+      pose.position.z =
+        scaleForVisualization(
+          current.z,
+          visualization_center_z_);
+
+      pose.orientation.x = quaternion.x();
+      pose.orientation.y = quaternion.y();
+      pose.orientation.z = quaternion.z();
+      pose.orientation.w = quaternion.w();
+
+      pose_array.poses.push_back(pose);
+
+      ++valid_pose_count;
+    }
+
+    poses_pub_->publish(pose_array);
+  }
+
   std::string gcode_file_;
 
   int path_stride_;
   int normal_stride_;
+  int pose_stride_;
 
   double visualization_scale_;
 
@@ -484,6 +693,10 @@ private:
   rclcpp::Publisher<
     visualization_msgs::msg::Marker>::SharedPtr
     normals_pub_;
+
+  rclcpp::Publisher<
+    geometry_msgs::msg::PoseArray>::SharedPtr
+    poses_pub_;
 
   rclcpp::TimerBase::SharedPtr timer_;
 };
