@@ -648,46 +648,54 @@ private:
       rotation.getRotation(quaternion);
       quaternion.normalize();
 
-      // Downsample only the RViz PoseArray.
-      // Orientation is still calculated for every valid
-      // deposition waypoint encountered above.
-      if ((valid_pose_count % stride) != 0) {
-        ++valid_pose_count;
-        continue;
-      }
+      // -------------------------------------------------------
+      // Real robot-side TCP pose.
+      //
+      // IMPORTANT: This path must always contain every valid
+      // deposition pose. It must never depend on pose_stride or
+      // visualization_scale.
+      // -------------------------------------------------------
 
-      geometry_msgs::msg::Pose pose;
       geometry_msgs::msg::Pose tcp_pose;
 
-      // Visualization-only PoseArray in print_frame.
-      // Convert to print-local coordinates first, then scale for RViz.
-      pose.position.x =
-        (current.x - print_origin_x_) *
-        visualization_scale_;
-
-      pose.position.y =
-        (current.y - print_origin_y_) *
-        visualization_scale_;
-
-      pose.position.z =
-        (current.z - print_origin_z_) *
-        visualization_scale_;
-
-      pose.orientation.x = quaternion.x();
-      pose.orientation.y = quaternion.y();
-      pose.orientation.z = quaternion.z();
-      pose.orientation.w = quaternion.w();
-
-      // Real-scale TCP pose in print_frame.
-      // No visualization scaling is applied here.
       tcp_pose.position.x = current.x - print_origin_x_;
       tcp_pose.position.y = current.y - print_origin_y_;
       tcp_pose.position.z = current.z - print_origin_z_;
 
-      tcp_pose.orientation = pose.orientation;
+      tcp_pose.orientation.x = quaternion.x();
+      tcp_pose.orientation.y = quaternion.y();
+      tcp_pose.orientation.z = quaternion.z();
+      tcp_pose.orientation.w = quaternion.w();
 
-      pose_array.poses.push_back(pose);
       tcp_pose_array.poses.push_back(tcp_pose);
+
+      // -------------------------------------------------------
+      // RViz-only PoseArray.
+      //
+      // Downsample only this visualization representation. The
+      // real /atomslicer/tcp_poses output above remains full
+      // resolution.
+      // -------------------------------------------------------
+
+      if ((valid_pose_count % stride) == 0) {
+        geometry_msgs::msg::Pose pose;
+
+        pose.position.x =
+          (current.x - print_origin_x_) *
+          visualization_scale_;
+
+        pose.position.y =
+          (current.y - print_origin_y_) *
+          visualization_scale_;
+
+        pose.position.z =
+          (current.z - print_origin_z_) *
+          visualization_scale_;
+
+        pose.orientation = tcp_pose.orientation;
+
+        pose_array.poses.push_back(pose);
+      }
 
       ++valid_pose_count;
     }
