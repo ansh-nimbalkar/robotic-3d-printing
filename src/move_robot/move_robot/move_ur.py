@@ -11,19 +11,10 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float32, Float32MultiArray, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-import roboticstoolbox as rtb
-from roboticstoolbox import DHRobot, RevoluteDH
 import spatialmath as sm
 
+from move_robot.ur10e_kinematics import JOINT_NAMES, UR10eKinematics
 
-JOINT_NAMES = (
-    "shoulder_pan_joint",
-    "shoulder_lift_joint",
-    "elbow_joint",
-    "wrist_1_joint",
-    "wrist_2_joint",
-    "wrist_3_joint",
-)
 
 # builtin_interfaces/Duration.sec is a signed 32-bit integer. This limit is
 # far beyond any trajectory duration expected here, but validating it avoids
@@ -111,26 +102,27 @@ class URcontrol(Node):
         self.shutdown_timer = None
 
         # ------------------------------------------------------------------
-        # Robotics Toolbox models
+        # Shared UR10e kinematics
         # ------------------------------------------------------------------
-        # RTB's standard model catalogue exposes the legacy UR10 as ``UR10``
-        # but does not expose a ``UR10e`` DH model in common releases.  Using
-        # the legacy UR10 model as a silent alias would be kinematically wrong:
-        # the UR10e has different manufacturer DH dimensions.
-        #
-        # Build the requested robot explicitly so IK/FK are based on the
-        # correct nominal UR10e geometry.  The two model instances preserve the
-        # existing repository architecture:
-        #   - robot_DH: numerical IK and joint-limit checks
-        #   - robot:    current-state FK/reporting
-        self.robot_DH, self.robot = self._create_robot_models(self.ur_type)
+        # One source of truth is shared with the AtomSlicer reachability and
+        # trajectory-planning nodes.  Keep a second model instance for the
+        # legacy FK/reporting state so command-side IK cannot mutate it.
+        if str(self.ur_type).strip().lower() != "ur10e":
+            raise ValueError(
+                f"Unsupported ur_type '{self.ur_type}'. "
+                "This implementation currently supports UR10e only."
+            )
+
+        self.kinematics = UR10eKinematics()
+        self.robot_DH = self.kinematics.robot
+        self.robot = UR10eKinematics.create_model()
 
         initial_q = np.asarray(self.robot_DH.q, dtype=float).copy()
         self.robot.q = initial_q.copy()
         self.robot_DH.q = initial_q.copy()
 
         self.get_logger().info(
-            "Using nominal UR10e DH kinematics from Universal Robots "
+            "Using shared nominal UR10e DH kinematics from Universal Robots "
             "manufacturer parameters."
         )
 
@@ -227,89 +219,6 @@ class URcontrol(Node):
     # ----------------------------------------------------------------------
     # Generic validation helpers
     # ----------------------------------------------------------------------
-    # ----------------------------------------------------------------------
-    # Robot-model construction
-    # ----------------------------------------------------------------------
-    @staticmethod
-    def _create_ur10e_dh_model() -> DHRobot:
-        """Create a nominal UR10e standard-DH model.
-
-        Robotics Toolbox commonly provides ``DH.UR10`` but not ``DH.UR10e``.
-        The legacy UR10 dimensions must not be used as an alias for UR10e
-        reachability or IK because the e-Series geometry differs.
-
-        These nominal kinematic dimensions are the manufacturer UR10e/UR12e
-        DH parameters, in metres:
-
-            a = [0, -0.6127, -0.57155, 0, 0, 0]
-            d = [0.1807, 0, 0, 0.17415, 0.11985, 0.11655]
-            alpha = [pi/2, 0, 0, pi/2, -pi/2, 0]
-
-        Joint limits are set to +/- 2*pi as the nominal kinematic range used
-        for this solver.  Before real hardware execution, the ROS/UR driver
-        model and the robot-specific calibration remain authoritative.
-        """
-        a = (0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0)
-        d = (0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655)
-        alpha = (
-            math.pi / 2.0,
-            0.0,
-            0.0,
-            math.pi / 2.0,
-            -math.pi / 2.0,
-            0.0,
-        )
-
-        nominal_joint_limits = np.array(
-            [-2.0 * math.pi, 2.0 * math.pi],
-            dtype=float,
-        )
-
-        links = [
-            RevoluteDH(
-                a=a_i,
-                d=d_i,
-                alpha=alpha_i,
-                qlim=nominal_joint_limits.copy(),
-            )
-            for a_i, d_i, alpha_i in zip(a, d, alpha)
-        ]
-
-        robot = DHRobot(
-            links,
-            name="UR10e",
-            manufacturer="Universal Robots",
-        )
-
-        # Keep the same convenient nominal configurations used by the RTB UR
-        # family while remaining explicit about this being the e-Series model.
-        robot.qz = np.zeros(6, dtype=float)
-        robot.qr = np.array(
-            [math.pi, 0.0, 0.0, 0.0, math.pi / 2.0, 0.0],
-            dtype=float,
-        )
-        robot.q = robot.qz.copy()
-
-        return robot
-
-    @classmethod
-    def _create_robot_models(cls, ur_type: str):
-        """Return IK and FK model instances for the configured robot.
-
-        The thesis execution pipeline currently targets UR10e only.  Failing
-        explicitly for another robot type is safer than silently substituting
-        a geometrically different RTB model.
-        """
-        normalized = str(ur_type).strip().lower()
-
-        if normalized == "ur10e":
-            return cls._create_ur10e_dh_model(), cls._create_ur10e_dh_model()
-
-        raise ValueError(
-            f"Unsupported ur_type '{ur_type}'. "
-            "This implementation currently supports UR10e only."
-        )
-
     @staticmethod
     def _is_valid_duration(seconds: float) -> bool:
         return (
@@ -341,55 +250,10 @@ class URcontrol(Node):
 
     @staticmethod
     def _validate_joint_vector(q: Sequence[float]) -> Optional[np.ndarray]:
-        try:
-            q_array = np.asarray(q, dtype=float).reshape(-1)
-        except (TypeError, ValueError):
-            return None
-
-        if q_array.size != len(JOINT_NAMES):
-            return None
-        if not np.all(np.isfinite(q_array)):
-            return None
-
-        return q_array
+        return UR10eKinematics.validate_joint_vector(q)
 
     def _joint_limits_satisfied(self, q: np.ndarray) -> bool:
-        """Check configured RTB joint limits when the model provides them."""
-        try:
-            qlim = np.asarray(self.robot_DH.qlim, dtype=float)
-        except (AttributeError, TypeError, ValueError):
-            return True
-
-        if qlim.shape != (2, len(JOINT_NAMES)):
-            return True
-
-        tolerance = 1e-9
-        lower = qlim[0, :]
-        upper = qlim[1, :]
-
-        lower_ok = np.logical_or(~np.isfinite(lower), q >= lower - tolerance)
-        upper_ok = np.logical_or(~np.isfinite(upper), q <= upper + tolerance)
-        return bool(np.all(lower_ok & upper_ok))
-
-    @staticmethod
-    def _extract_ik_result(result):
-        """Compatibility adapter for old and new Robotics Toolbox IK APIs.
-
-        Older RTB versions returned tuple-like results from the fast solver;
-        newer versions return an IKSolution object. The repository does not pin
-        an RTB version, so supporting both avoids a fragile environment-specific
-        assumption.
-        """
-        if hasattr(result, "q"):
-            q = result.q
-            success = bool(getattr(result, "success", q is not None))
-            reason = str(getattr(result, "reason", ""))
-            return q, success, reason
-
-        if isinstance(result, (tuple, list)) and len(result) >= 2:
-            return result[0], bool(result[1]), ""
-
-        return None, False, "Unsupported IK result format"
+        return self.kinematics.joint_limits_satisfied(q)
 
     # ----------------------------------------------------------------------
     # Existing keyboard / lifecycle callbacks
@@ -793,7 +657,7 @@ class URcontrol(Node):
         desired_pose,
         seed_q: Optional[Sequence[float]] = None,
     ) -> Optional[np.ndarray]:
-        """Solve IK with compatibility across Robotics Toolbox API versions."""
+        """Solve IK through the shared UR10e kinematics implementation."""
         if seed_q is None:
             seed = np.asarray(self.robot.q, dtype=float).copy()
         else:
@@ -802,48 +666,18 @@ class URcontrol(Node):
                 self.get_logger().error("IK rejected: invalid seed configuration.")
                 return None
 
-        # Fast/C++-backed solver first, preserving the existing repository's
-        # preferred behaviour.
-        try:
-            result = self.robot_DH.ik_LM(
-                desired_pose,
-                q0=seed,
-                joint_limits=True,
-            )
-            q, success, reason = self._extract_ik_result(result)
-            q_array = self._validate_joint_vector(q) if q is not None else None
+        result = self.kinematics.solve_ik(
+            desired_pose,
+            seed_q=seed,
+        )
 
-            if success and q_array is not None and self._joint_limits_satisfied(q_array):
-                return q_array
+        if result.success and result.q is not None:
+            return result.q
 
-            if self.toggle_log:
-                detail = f" ({reason})" if reason else ""
-                self.get_logger().warn(
-                    "Fast IK solver did not return a valid solution" + detail + "."
-                )
-        except Exception as exc:
-            self.get_logger().warn(f"Fast IK solver failed: {exc}")
-
-        # Portable Python solver fallback.
-        try:
-            result = self.robot_DH.ikine_LM(
-                desired_pose,
-                q0=seed,
-                joint_limits=True,
-            )
-            q, success, reason = self._extract_ik_result(result)
-            q_array = self._validate_joint_vector(q) if q is not None else None
-
-            if success and q_array is not None and self._joint_limits_satisfied(q_array):
-                return q_array
-
-            detail = f" ({reason})" if reason else ""
-            self.get_logger().error(
-                "Python IK solver did not return a valid solution" + detail + "."
-            )
-        except Exception as exc:
-            self.get_logger().error(f"Python IK solver failed: {exc}")
-
+        self.get_logger().error(
+            "IK solver did not return a valid UR10e solution"
+            + (f": {result.reason}" if result.reason else ".")
+        )
         return None
 
     def publish_is_moving(self):

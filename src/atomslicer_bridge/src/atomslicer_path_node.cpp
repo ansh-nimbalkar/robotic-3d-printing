@@ -6,6 +6,7 @@
 
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Vector3.h>
 
 #include <algorithm>
 #include <cmath>
@@ -505,6 +506,34 @@ private:
 
     std::size_t valid_pose_count = 0;
 
+    // -----------------------------------------------------------------
+    // Rotation-minimising / minimum-twist frame state.
+    //
+    // The first valid deposition pose uses the projected deposition
+    // tangent to establish TCP +X.  Every subsequent pose transports
+    // the previous frame with the smallest possible rotation that maps
+    // the previous surface normal onto the new one.
+    //
+    // Therefore:
+    //   +Z remains exactly aligned with the AtomSlicer surface normal.
+    //   +X/+Y do not follow instantaneous tangent fluctuations.
+    //   unnecessary roll about +Z is removed.
+    //
+    // This is intentionally the standard orientation behaviour rather
+    // than a selectable mode because the robot should not be commanded
+    // to perform avoidable tool-axis rotation during printing.
+    // -----------------------------------------------------------------
+
+    bool frame_initialised = false;
+
+    tf2::Vector3 previous_x_axis(1.0, 0.0, 0.0);
+    tf2::Vector3 previous_z_axis(0.0, 0.0, 1.0);
+
+    tf2::Quaternion previous_quaternion(
+      0.0, 0.0, 0.0, 1.0);
+
+    constexpr double epsilon = 1e-12;
+
     for (std::size_t i = 1;
          i < waypoints_.size();
          ++i)
@@ -518,149 +547,228 @@ private:
         continue;
       }
 
-      // -------------------------------------------------------
-      // TCP Z axis:
-      // AtomSlicer tool normal.
-      // -------------------------------------------------------
+      // ---------------------------------------------------------------
+      // TCP +Z axis: normalised AtomSlicer surface/tool normal.
+      // ---------------------------------------------------------------
 
-      double zx = current.nx;
-      double zy = current.ny;
-      double zz = current.nz;
+      tf2::Vector3 z_axis(
+        current.nx,
+        current.ny,
+        current.nz);
 
-      const double normal_magnitude =
-        std::sqrt(
-          zx * zx +
-          zy * zy +
-          zz * zz);
-
-      if (normal_magnitude < 1e-9) {
+      if (z_axis.length2() < epsilon) {
+        // A valid surface-aligned TCP cannot be constructed without a
+        // valid normal.  Skip only this malformed waypoint.
         continue;
       }
 
-      zx /= normal_magnitude;
-      zy /= normal_magnitude;
-      zz /= normal_magnitude;
+      z_axis.normalize();
 
-      // -------------------------------------------------------
+      // ---------------------------------------------------------------
       // Local deposition tangent.
       //
-      // The extrusion value at the current waypoint describes
-      // the move from previous -> current.
-      // -------------------------------------------------------
+      // This is used to initialise the roll of the first valid TCP and
+      // as a robust fallback only.  It is deliberately NOT imposed at
+      // every waypoint because doing so caused the large wrist_3/TCP
+      // roll discontinuities identified by the continuity diagnostics.
+      // ---------------------------------------------------------------
 
-      double dx = current.x - previous.x;
-      double dy = current.y - previous.y;
-      double dz = current.z - previous.z;
+      tf2::Vector3 tangent(
+        current.x - previous.x,
+        current.y - previous.y,
+        current.z - previous.z);
 
-      const double tangent_magnitude =
-        std::sqrt(
-          dx * dx +
-          dy * dy +
-          dz * dz);
+      bool tangent_valid = tangent.length2() >= epsilon;
 
-      if (tangent_magnitude < 1e-9) {
-        continue;
+      if (tangent_valid) {
+        tangent.normalize();
+
+        // Project the tangent into the plane perpendicular to +Z.
+        tangent -= z_axis * tangent.dot(z_axis);
+
+        tangent_valid = tangent.length2() >= epsilon;
+
+        if (tangent_valid) {
+          tangent.normalize();
+        }
       }
 
-      dx /= tangent_magnitude;
-      dy /= tangent_magnitude;
-      dz /= tangent_magnitude;
+      tf2::Vector3 x_axis;
 
-      // -------------------------------------------------------
-      // TCP X axis:
-      // Project the path tangent onto the plane perpendicular
-      // to the tool normal.
-      // -------------------------------------------------------
+      if (!frame_initialised) {
+        // -------------------------------------------------------------
+        // First valid deposition pose:
+        // establish roll from the deposition direction.
+        // -------------------------------------------------------------
 
-      const double tangent_dot_normal =
-        dx * zx +
-        dy * zy +
-        dz * zz;
+        if (tangent_valid) {
+          x_axis = tangent;
+        } else {
+          // Extremely rare geometric degeneracy.  Choose a stable
+          // world-axis reference least aligned with the tool normal,
+          // then project it onto the tangent plane.  This avoids
+          // dropping an otherwise valid TCP pose.
+          tf2::Vector3 reference_axis =
+            std::abs(z_axis.x()) < 0.9 ?
+            tf2::Vector3(1.0, 0.0, 0.0) :
+            tf2::Vector3(0.0, 1.0, 0.0);
 
-      double xx =
-        dx - tangent_dot_normal * zx;
+          x_axis =
+            reference_axis -
+            z_axis * reference_axis.dot(z_axis);
 
-      double xy =
-        dy - tangent_dot_normal * zy;
+          if (x_axis.length2() < epsilon) {
+            continue;
+          }
 
-      double xz =
-        dz - tangent_dot_normal * zz;
+          x_axis.normalize();
+        }
 
-      const double x_magnitude =
-        std::sqrt(
-          xx * xx +
-          xy * xy +
-          xz * xz);
+        frame_initialised = true;
+      } else {
+        // -------------------------------------------------------------
+        // Minimum-twist transport.
+        //
+        // Find the smallest 3-D rotation that maps previous +Z onto
+        // current +Z.  Applying that same rotation to previous +X
+        // parallel-transports the frame without adding any rotation
+        // around the tool axis.
+        // -------------------------------------------------------------
 
-      // Degenerate case where the trajectory tangent is
-      // effectively parallel to the normal.
-      if (x_magnitude < 1e-9) {
-        continue;
+        const double normal_dot =
+          std::clamp(
+            previous_z_axis.dot(z_axis),
+            -1.0,
+            1.0);
+
+        tf2::Quaternion transport_quaternion;
+
+        if (normal_dot > -1.0 + 1e-10) {
+          // For two unit vectors a and b, quaternion
+          // [a x b, 1 + a.b], after normalisation, represents the
+          // minimum rotation from a to b.
+          const tf2::Vector3 cross =
+            previous_z_axis.cross(z_axis);
+
+          transport_quaternion =
+            tf2::Quaternion(
+              cross.x(),
+              cross.y(),
+              cross.z(),
+              1.0 + normal_dot);
+
+          if (transport_quaternion.length2() < epsilon) {
+            transport_quaternion =
+              tf2::Quaternion(0.0, 0.0, 0.0, 1.0);
+          } else {
+            transport_quaternion.normalize();
+          }
+        } else {
+          // Opposite normals are a mathematically ambiguous 180-degree
+          // case.  Rotating around the previous +X axis preserves roll
+          // as well as possible and still maps +Z to -Z.
+          transport_quaternion.setRotation(
+            previous_x_axis,
+            M_PI);
+
+          transport_quaternion.normalize();
+        }
+
+        const tf2::Matrix3x3 transport_rotation(
+          transport_quaternion);
+
+        x_axis =
+          transport_rotation * previous_x_axis;
+
+        // Remove tiny numerical components parallel to +Z.
+        x_axis -=
+          z_axis * x_axis.dot(z_axis);
+
+        if (x_axis.length2() < epsilon) {
+          // Robust fallback: use the local deposition tangent if the
+          // transported axis became degenerate.
+          if (!tangent_valid) {
+            continue;
+          }
+
+          x_axis = tangent;
+
+          // The tangent has two equivalent signs.  Prefer the sign
+          // closest to the previously transported frame to avoid an
+          // artificial 180-degree roll flip.
+          if (x_axis.dot(previous_x_axis) < 0.0) {
+            x_axis = -x_axis;
+          }
+        }
+
+        x_axis.normalize();
       }
 
-      xx /= x_magnitude;
-      xy /= x_magnitude;
-      xz /= x_magnitude;
-
-      // -------------------------------------------------------
-      // TCP Y axis = Z x X.
-      // -------------------------------------------------------
-
-      double yx =
-        zy * xz - zz * xy;
-
-      double yy =
-        zz * xx - zx * xz;
-
-      double yz =
-        zx * xy - zy * xx;
-
-      const double y_magnitude =
-        std::sqrt(
-          yx * yx +
-          yy * yy +
-          yz * yz);
-
-      if (y_magnitude < 1e-9) {
-        continue;
-      }
-
-      yx /= y_magnitude;
-      yy /= y_magnitude;
-      yz /= y_magnitude;
-
-      // -------------------------------------------------------
-      // At this point:
+      // ---------------------------------------------------------------
+      // Complete a right-handed orthonormal TCP frame.
       //
-      // X = local deposition direction
       // Y = Z x X
-      // Z = AtomSlicer tool normal
-      //
-      // These axes form the complete TCP orientation.
-      // -------------------------------------------------------
+      // X = Y x Z  (second pass removes accumulated numerical drift)
+      // ---------------------------------------------------------------
+
+      tf2::Vector3 y_axis =
+        z_axis.cross(x_axis);
+
+      if (y_axis.length2() < epsilon) {
+        continue;
+      }
+
+      y_axis.normalize();
+
+      x_axis =
+        y_axis.cross(z_axis);
+
+      if (x_axis.length2() < epsilon) {
+        continue;
+      }
+
+      x_axis.normalize();
 
       tf2::Matrix3x3 rotation(
-        xx, yx, zx,
-        xy, yy, zy,
-        xz, yz, zz);
+        x_axis.x(), y_axis.x(), z_axis.x(),
+        x_axis.y(), y_axis.y(), z_axis.y(),
+        x_axis.z(), y_axis.z(), z_axis.z());
 
       tf2::Quaternion quaternion;
       rotation.getRotation(quaternion);
       quaternion.normalize();
 
-      // -------------------------------------------------------
-      // Real robot-side TCP pose.
+      // Quaternions q and -q represent the same physical rotation.
+      // Keep a consistent quaternion hemisphere so downstream
+      // interpolation/logging does not see artificial sign changes.
+      if (valid_pose_count > 0 &&
+          quaternion.dot(previous_quaternion) < 0.0)
+      {
+        quaternion =
+          tf2::Quaternion(
+            -quaternion.x(),
+            -quaternion.y(),
+            -quaternion.z(),
+            -quaternion.w());
+      }
+
+      // ---------------------------------------------------------------
+      // Real-scale TCP pose.
       //
-      // IMPORTANT: This path must always contain every valid
-      // deposition pose. It must never depend on pose_stride or
-      // visualization_scale.
-      // -------------------------------------------------------
+      // IMPORTANT: every valid deposition pose is published here.
+      // pose_stride must never downsample the robot-planning input.
+      // ---------------------------------------------------------------
 
       geometry_msgs::msg::Pose tcp_pose;
 
-      tcp_pose.position.x = current.x - print_origin_x_;
-      tcp_pose.position.y = current.y - print_origin_y_;
-      tcp_pose.position.z = current.z - print_origin_z_;
+      tcp_pose.position.x =
+        current.x - print_origin_x_;
+
+      tcp_pose.position.y =
+        current.y - print_origin_y_;
+
+      tcp_pose.position.z =
+        current.z - print_origin_z_;
 
       tcp_pose.orientation.x = quaternion.x();
       tcp_pose.orientation.y = quaternion.y();
@@ -669,13 +777,16 @@ private:
 
       tcp_pose_array.poses.push_back(tcp_pose);
 
-      // -------------------------------------------------------
-      // RViz-only PoseArray.
+      // Save the completed frame for the next minimum-twist transport.
+      previous_x_axis = x_axis;
+      previous_z_axis = z_axis;
+      previous_quaternion = quaternion;
+
+      // ---------------------------------------------------------------
+      // Visualization PoseArray only.
       //
-      // Downsample only this visualization representation. The
-      // real /atomslicer/tcp_poses output above remains full
-      // resolution.
-      // -------------------------------------------------------
+      // Downsample AFTER the real TCP pose has been stored.
+      // ---------------------------------------------------------------
 
       if ((valid_pose_count % stride) == 0) {
         geometry_msgs::msg::Pose pose;

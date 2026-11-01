@@ -4,7 +4,7 @@
   <name>move_robot</name>
   <version>0.1.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="z5311131@ad.unsw.edu.au">Abdul Shahzeb</maintainer>
+  <maintainer email="z5415892@ad.unsw.edu.au">Abdul Shahzeb</maintainer>
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>
@@ -12,6 +12,8 @@
   <depend>trajectory_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>visualization_msgs</depend>
   <depend>time</depend>
 
   <exec_depend>ros2launch</exec_depend>

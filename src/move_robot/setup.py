@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'move_ur = move_robot.move_ur:main',
+            'atomslicer_trajectory = move_robot.atomslicer_trajectory:main',
             'calibrate_extruder = move_robot.calibrate_extruder:main',
             'gcode_interpreter = move_robot.gcode_interpreter:main',
             'keyboard_node = move_robot.keyboard:main',
